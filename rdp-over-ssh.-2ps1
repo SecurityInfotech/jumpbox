@@ -77,6 +77,26 @@ $subscriptionId = Read-Host "Enter the subscription ID"
 $jumpboxVM = Read-Host "Enter the jumpbox VM name"
 $targetVM = Read-Host "Enter the target VM name"
 
+
+# Function to validate Azure login
+function Validate-AzureLogin {
+    param (
+        [string]$TenantId
+    )
+    $token = az account get-access-token --query "accessToken" -o tsv 2>$null
+    if (-not $token) {
+        Write-Host "Azure CLI token is expired or invalid. Logging in..."
+        az login --tenant $TenantId
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "Error: Failed to log in to Azure."
+            exit 1
+        }
+    } else {
+        Write-Host "Azure CLI token is valid."
+    }
+}
+
+
 # Check if already logged in
 try {
     $account = az account show --query "{name:name}" -o json | ConvertFrom-Json
