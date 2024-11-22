@@ -1,0 +1,171 @@
+# Filename: Connect-RDPOverSSH.ps1
+
+<#
+.SYNOPSIS
+    Automates the process of connecting to an Azure Windows VM via RDP over an SSH tunnel through a Linux jumpbox VM.
+
+.DESCRIPTION
+    This script checks if both the jumpbox VM and the target Windows VM are running.
+    It generates an SSH configuration for the jumpbox VM and establishes an SSH tunnel to the target VM.
+    It selects a random available local port for the SSH tunnel to avoid conflicts when connecting to multiple VMs.
+    It then launches the RDP client to connect to the target VM via the SSH tunnel.
+
+.REQUIREMENTS
+    - Azure CLI ('az' command)
+    - Azure CLI SSH extension
+    - OpenSSH client (ssh.exe)
+    - Remote Desktop Client (mstsc.exe) for RDP connections
+
+.INSTALLATION
+    # Install Azure CLI:
+    https://learn.microsoft.com/en-us/cli/azure/install-azure-cli-windows
+
+    # Install Azure CLI SSH extension:
+    az extension add --name ssh
+
+    # Ensure OpenSSH Client is installed (for Windows 10 and newer):
+    Settings > Apps > Optional features > Add a feature > OpenSSH Client
+
+    # Ensure Remote Desktop Client (mstsc.exe) is available (comes with Windows)
+
+.EXAMPLE
+    .\Connect-RDPOverSSH.ps1
+#>
+
+# Function to check if a VM is running
+function Check-VMRunning {
+    param (
+        [string]$ResourceGroup,
+        [string]$VMName
+    )
+    $vmStatus = az vm get-instance-view --resource-group $ResourceGroup --name $VMName --query "instanceView.statuses[?starts_with(code, 'PowerState/')].displayStatus" -o tsv
+    if ($vmStatus -ne "VM running") {
+        Write-Host "Error: VM '$VMName' in resource group '$ResourceGroup' is not running. Current status: $vmStatus"
+        exit 1
+    }
+}
+
+# Function to find an available port
+function Find-AvailablePort {
+    $minPort = 1024
+    $maxPort = 65535
+    while ($true) {
+        $port = Get-Random -Minimum $minPort -Maximum $maxPort
+        $tcpConnection = Get-NetTCPConnection -LocalPort $port -ErrorAction SilentlyContinue
+        if (-not $tcpConnection) {
+            return $port
+        }
+    }
+}
+
+# Check if required commands are installed
+if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
+    Write-Host "Error: Azure CLI ('az') is not installed. Please install it from https://learn.microsoft.com/en-us/cli/azure/install-azure-cli-windows"
+    exit 1
+}
+
+# Check if Azure CLI SSH extension is installed
+$sshExtension = az extension list --query "[?name=='ssh']" -o tsv
+if (-not $sshExtension) {
+    Write-Host "Azure SSH extension not found. Installing..."
+    az extension add --name ssh
+}
+
+# Prompt for inputs
+$azureTenant = Read-Host "Enter the Azure tenant ID"
+$subscriptionId = Read-Host "Enter the subscription ID"
+$jumpboxVM = Read-Host "Enter the jumpbox VM name"
+$targetVM = Read-Host "Enter the target VM name"
+
+# Check if already logged in
+try {
+    $account = az account show --query "{name:name}" -o json | ConvertFrom-Json
+    if (-not $account) {
+        throw "Not logged in"
+    }
+    Write-Host "Already logged into Azure as $($account.name)."
+} catch {
+    Write-Host "Logging into Azure..."
+    az login --tenant $azureTenant
+}
+
+# Set the subscription
+Write-Host "Setting the subscription..."
+az account set --subscription $subscriptionId
+
+# Function to get the resource group of a VM
+function Get-VMResourceGroup {
+    param (
+        [string]$VMName
+    )
+    $resourceGroup = az vm list --query "[?name=='$VMName'].resourceGroup" -o tsv
+    if (-not $resourceGroup) {
+        Write-Host "Error: VM '$VMName' not found."
+        exit 1
+    }
+    return $resourceGroup
+}
+
+# Get resource groups
+Write-Host "Retrieving resource group for jumpbox VM..."
+$jumpboxResourceGroup = Get-VMResourceGroup -VMName $jumpboxVM
+Write-Host "Jumpbox VM resource group: $jumpboxResourceGroup"
+
+Write-Host "Retrieving resource group for target VM..."
+$targetResourceGroup = Get-VMResourceGroup -VMName $targetVM
+Write-Host "Target VM resource group: $targetResourceGroup"
+
+# Check if VMs are running
+Write-Host "Checking if Jumpbox VM is running..."
+Check-VMRunning -ResourceGroup $jumpboxResourceGroup -VMName $jumpboxVM
+
+Write-Host "Checking if Target VM is running..."
+Check-VMRunning -ResourceGroup $targetResourceGroup -VMName $targetVM
+
+# Generate SSH config for the jumpbox VM
+$sshConfigFile = ".\sshconfig"
+
+Write-Host "Generating SSH configuration for the jumpbox VM..."
+az ssh config --file $sshConfigFile --resource-group $jumpboxResourceGroup --name $jumpboxVM --overwrite
+
+# Retrieve the private IP address of the target VM
+Write-Host "Retrieving the private IP address of the target VM..."
+$targetIP = az vm show --show-details --resource-group $targetResourceGroup --name $targetVM --query "privateIps" -o tsv
+
+if (-not $targetIP) {
+    Write-Host "Error: Could not retrieve the private IP address of the target VM."
+    exit 1
+}
+
+Write-Host "Target VM IP address: $targetIP"
+
+# Find an available port
+Write-Host "Finding an available local port..."
+$localPort = Find-AvailablePort
+Write-Host "Selected local port: $localPort"
+
+# Establish the SSH tunnel
+Write-Host "Establishing SSH tunnel to the target VM through the jumpbox..."
+$sshArguments = "-f -F `"$sshConfigFile`" `$jumpboxVM -L $localPort:`"$targetIP`":3389 -N"
+Start-Process ssh.exe -ArgumentList $sshArguments -NoNewWindow -Wait
+
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "Error: Failed to establish SSH tunnel."
+    exit 1
+}
+
+Write-Host "SSH tunnel established. You can now connect to the target VM via RDP on localhost:$localPort"
+
+# Automatically launch RDP client
+if (Get-Command mstsc.exe -ErrorAction SilentlyContinue) {
+    Write-Host "Launching RDP client..."
+    Start-Process mstsc.exe -ArgumentList "/v:localhost:$localPort"
+} else {
+    Write-Host "Please connect to 'localhost:$localPort' using your RDP client."
+}
+
+# Cleanup SSH config file
+Write-Host "Cleaning up SSH configuration file..."
+Remove-Item $sshConfigFile -Force
+
+Write-Host "Done."
