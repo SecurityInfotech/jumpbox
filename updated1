@@ -1,0 +1,417 @@
+################################################################################
+# MODULE: single_assignment_pim
+################################################################################
+
+terraform {
+  required_version = ">= 1.3.0"
+
+  required_providers {
+    azurerm = {
+      source  = "hashicorp/azurerm"
+      version = ">= 3.50.0"
+    }
+    azuread = {
+      source  = "hashicorp/azuread"
+      version = ">= 2.28.0"
+    }
+  }
+}
+
+variable "assignment" {
+  description = <<EOT
+A single assignment set for one principal at one scope.
+
+Variables are split into three categories:
+  1) "active_" for azurerm_role_assignment (normal RBAC)
+  2) "eligible_" for azurerm_pim_eligible_role_assignment (PIM)
+  3) "policy_" for azurerm_role_management_policy
+
+We do not support principal_type = "User". Only "Group" or "ServicePrincipal".
+
+Structure:
+{
+  # Basic scope & principal lookups
+  scope          = string
+  principal_name = string
+  principal_type = string  # "Group" or "ServicePrincipal" only
+
+  # If policy_activation_require_approval = true, specify the group name
+  pim_approver_group_name = optional(string)
+
+  # ACTIVE (azurerm_role_assignment) related
+  active_active_description   = optional(string)
+  active_rbac_admin_condition = optional(string)
+  active_roles = list(string)
+
+  # ELIGIBLE (azurerm_pim_eligible_role_assignment) related
+  eligible_justification    = optional(string)
+  eligible_ticket_number    = optional(string)
+  eligible_ticket_system    = optional(string)
+  eligible_start_date_time  = optional(string)
+  eligible_expiration_days  = optional(number)
+  eligible_expiration_hours = optional(number)
+  eligible_end_date_time    = optional(string)
+  pim_roles = list(string)
+
+  # POLICY (azurerm_role_management_policy) - Active Assignment Rules
+  policy_active_expiration_required  = optional(bool)
+  policy_active_expire_after         = optional(string)  # e.g. "P365D"
+  policy_active_require_justification = optional(bool)
+  policy_active_require_multifactor_authentication = optional(bool)
+  policy_active_require_ticket_info   = optional(bool)
+
+  # POLICY (azurerm_role_management_policy) - Eligible Assignment Rules
+  policy_eligible_expiration_required = optional(bool)
+  policy_eligible_expire_after       = optional(string) # e.g. "P180D"
+
+  # POLICY (azurerm_role_management_policy) - Activation Rules
+  policy_activation_maximum_duration                 = optional(string) # e.g. "PT8H"
+  policy_activation_require_approval                 = optional(bool)
+  policy_activation_require_justification            = optional(bool)
+  policy_activation_require_multifactor_authentication = optional(bool)
+  policy_activation_require_ticket_info              = optional(bool)
+
+  # POLICY (azurerm_role_management_policy) - Minimal Notifications
+  policy_notify_active_assignments_notification_level   = optional(string)
+  policy_notify_eligible_assignments_notification_level = optional(string)
+  policy_notify_eligible_activations_notification_level = optional(string)
+}
+EOT
+
+  type = object({
+    ############################################################################
+    # Basic Info
+    ############################################################################
+    scope          = string
+    principal_name = string
+    principal_type = string  # "Group" or "ServicePrincipal"
+
+    pim_approver_group_name = optional(string)
+
+    ############################################################################
+    # ACTIVE: azurerm_role_assignment
+    ############################################################################
+    active_active_description   = optional(string)
+    active_rbac_admin_condition = optional(string)
+    active_roles = list(string)
+
+    ############################################################################
+    # ELIGIBLE: azurerm_pim_eligible_role_assignment
+    ############################################################################
+    eligible_justification    = optional(string)
+    eligible_ticket_number    = optional(string)
+    eligible_ticket_system    = optional(string)
+    eligible_start_date_time  = optional(string)
+    eligible_expiration_days  = optional(number)
+    eligible_expiration_hours = optional(number)
+    eligible_end_date_time    = optional(string)
+    pim_roles = list(string)
+
+    ############################################################################
+    # POLICY: Active Assignment Rules
+    ############################################################################
+    policy_active_expiration_required  = optional(bool)
+    policy_active_expire_after         = optional(string)
+    policy_active_require_justification = optional(bool)
+    policy_active_require_multifactor_authentication = optional(bool)
+    policy_active_require_ticket_info  = optional(bool)
+
+    ############################################################################
+    # POLICY: Eligible Assignment Rules
+    ############################################################################
+    policy_eligible_expiration_required = optional(bool)
+    policy_eligible_expire_after       = optional(string)
+
+    ############################################################################
+    # POLICY: Activation (PIM)
+    ############################################################################
+    policy_activation_maximum_duration                 = optional(string)
+    policy_activation_require_approval                 = optional(bool)
+    policy_activation_require_justification            = optional(bool)
+    policy_activation_require_multifactor_authentication = optional(bool)
+    policy_activation_require_ticket_info              = optional(bool)
+
+    ############################################################################
+    # POLICY: Minimal Notifications
+    ############################################################################
+    policy_notify_active_assignments_notification_level   = optional(string)
+    policy_notify_eligible_assignments_notification_level = optional(string)
+    policy_notify_eligible_activations_notification_level = optional(string)
+  })
+}
+
+locals {
+  a = var.assignment
+
+  # Do we have any pim roles
+  has_pim_roles = length(local.a.pim_roles) > 0
+  has_pim_group = local.a.pim_approver_group_name != null
+
+  # active set & pim set
+  active_set = toset(local.a.active_roles)
+  pim_set    = toset(local.a.pim_roles)
+
+  # union list => a single set of all role names
+  union_list = concat(var.assignment.active_roles, var.assignment.pim_roles)
+  union_set  = toset(local.union_list)
+}
+
+################################################################################
+# 1) Lookup Principal (Group or ServicePrincipal)
+################################################################################
+
+data "azuread_group" "principal_grp" {
+  count        = local.a.principal_type == "Group" ? 1 : 0
+  display_name = local.a.principal_name
+}
+
+data "azuread_service_principal" "principal_sp" {
+  count        = local.a.principal_type == "ServicePrincipal" ? 1 : 0
+  display_name = local.a.principal_name
+}
+
+locals {
+  principal_id = local.a.principal_type == "Group"
+    ? data.azuread_group.principal_grp[0].object_id
+    : data.azuread_service_principal.principal_sp[0].id
+}
+
+################################################################################
+# 2) Lookup PIM Approver Group If Needed
+################################################################################
+
+data "azuread_group" "pim_approver" {
+  count        = local.has_pim_roles && local.has_pim_group ? 1 : 0
+  display_name = local.a.pim_approver_group_name
+}
+
+locals {
+  pim_approver_group_id = (length(data.azuread_group.pim_approver) > 0)
+    ? data.azuread_group.pim_approver[0].object_id
+    : null
+}
+
+################################################################################
+# 3) Look Up Role Definitions for union_set
+################################################################################
+
+data "azurerm_role_definition" "all_defs" {
+  for_each = local.union_set
+
+  name  = each.value
+  scope = local.a.scope
+}
+
+################################################################################
+# 4) ACTIVE: azurerm_role_assignment for roles in active_set
+################################################################################
+
+resource "azurerm_role_assignment" "normal" {
+  for_each = data.azurerm_role_definition.all_defs
+    if contains(local.active_set, each.key)
+
+  scope        = local.a.scope
+  principal_id = local.principal_id
+  principal_type = local.a.principal_type
+
+  role_definition_id = each.value.role_definition_resource_id
+  description        = local.a.active_active_description
+
+  # If role is "Role Based Access Control Administrator" => apply condition
+  condition = (
+    lower(each.key) == "role based access control administrator"
+    && local.a.active_rbac_admin_condition != null
+  ) ? local.a.active_rbac_admin_condition : null
+
+  condition_version = (
+    lower(each.key) == "role based access control administrator"
+    && local.a.active_rbac_admin_condition != null
+  ) ? "2.0" : null
+}
+
+################################################################################
+# 5) ELIGIBLE: azurerm_pim_eligible_role_assignment for roles in pim_set
+################################################################################
+
+resource "azurerm_pim_eligible_role_assignment" "eligible" {
+  for_each = data.azurerm_role_definition.all_defs
+    if contains(local.pim_set, each.key)
+
+  scope        = local.a.scope
+  principal_id = local.principal_id
+
+  role_definition_id = each.value.role_definition_resource_id
+
+  justification = local.a.eligible_justification
+
+  schedule {
+    start_date_time = local.a.eligible_start_date_time
+
+    expiration {
+      duration_days  = local.a.eligible_expiration_days
+      duration_hours = local.a.eligible_expiration_hours
+      end_date_time  = local.a.eligible_end_date_time
+    }
+  }
+
+  ticket {
+    number = local.a.eligible_ticket_number
+    system = local.a.eligible_ticket_system
+  }
+}
+
+################################################################################
+# 6) POLICY: azurerm_role_management_policy for each role in union_set
+################################################################################
+
+resource "azurerm_role_management_policy" "policy" {
+  for_each = data.azurerm_role_definition.all_defs
+
+  scope              = local.a.scope
+  role_definition_id = each.value.role_definition_resource_id
+
+  ##############################################################################
+  # 6A) Active Assignment Rules (only if role in active_set)
+  ##############################################################################
+  dynamic "active_assignment_rules" {
+    for_each = contains(local.active_set, each.key) ? [1] : []
+    content {
+      # "One of expiration_required or expire_after must be provided."
+      expiration_required = coalesce(local.a.policy_active_expiration_required, false)
+      expire_after        = local.a.policy_active_expire_after != null ? local.a.policy_active_expire_after : null
+
+      require_justification            = coalesce(local.a.policy_active_require_justification, false)
+      require_multifactor_authentication = coalesce(local.a.policy_active_require_multifactor_authentication, false)
+      require_ticket_info              = coalesce(local.a.policy_active_require_ticket_info, false)
+    }
+  }
+
+  ##############################################################################
+  # 6B) Eligible Assignment Rules (only if role in pim_set)
+  ##############################################################################
+  dynamic "eligible_assignment_rules" {
+    for_each = contains(local.pim_set, each.key) ? [1] : []
+    content {
+      expiration_required = coalesce(local.a.policy_eligible_expiration_required, false)
+      expire_after        = local.a.policy_eligible_expire_after != null ? local.a.policy_eligible_expire_after : null
+    }
+  }
+
+  ##############################################################################
+  # 6C) Activation Rules (only if role in pim_set)
+  ##############################################################################
+  dynamic "activation_rules" {
+    for_each = contains(local.pim_set, each.key) ? [1] : []
+    content {
+      maximum_duration = coalesce(local.a.policy_activation_maximum_duration, "PT8H")
+      require_approval = coalesce(local.a.policy_activation_require_approval, false)
+
+      require_justification            = coalesce(local.a.policy_activation_require_justification, false)
+      require_multifactor_authentication = coalesce(local.a.policy_activation_require_multifactor_authentication, false)
+      require_ticket_info              = coalesce(local.a.policy_activation_require_ticket_info, false)
+
+      dynamic "approval_stage" {
+        for_each = coalesce(local.a.policy_activation_require_approval, false) ? [1] : []
+        content {
+          primary_approver {
+            object_id = local.pim_approver_group_id
+            type      = "Group"
+          }
+        }
+      }
+    }
+  }
+
+  ##############################################################################
+  # 6D) Minimal Notification Rules
+  #    "At least one notification_target block must be provided."
+  #    We'll define 3 notification_targets: active, eligible, eligible activations
+  ##############################################################################
+  notification_rules {
+    # Active assignments
+    active_assignments {
+      admin_notifications {
+        notification_level    = coalesce(local.a.policy_notify_active_assignments_notification_level, "Critical")
+        default_recipients    = false
+        additional_recipients = []
+      }
+    }
+
+    # Eligible assignments
+    eligible_assignments {
+      approver_notifications {
+        notification_level    = coalesce(local.a.policy_notify_eligible_assignments_notification_level, "Critical")
+        default_recipients    = false
+        additional_recipients = []
+      }
+    }
+
+    # Eligible activations
+    eligible_activations {
+      assignee_notifications {
+        notification_level    = coalesce(local.a.policy_notify_eligible_activations_notification_level, "All")
+        default_recipients    = true
+        additional_recipients = []
+      }
+    }
+  }
+}
+
+################################################################################
+# Outputs
+################################################################################
+
+output "active_role_assignment_ids" {
+  description = "IDs of all normal RBAC assignments."
+  value       = [for ra in azurerm_role_assignment.normal : ra.id]
+}
+
+output "eligible_role_assignment_ids" {
+  description = "IDs of all PIM-eligible role assignments."
+  value       = [for e in azurerm_pim_eligible_role_assignment.eligible : e.id]
+}
+
+output "policy_ids" {
+  description = "IDs of the role management policy for each role in union of active+pim."
+  value       = [for pol in azurerm_role_management_policy.policy : pol.id]
+}
+
+module "example" {
+  source = "./modules/single_assignment_pim"
+
+  assignment = {
+    scope          = data.azurerm_subscription.primary.id
+    principal_name = "MySecGroup"
+    principal_type = "Group"
+
+    # Let's set some policy config for active roles:
+    policy_active_expiration_required  = false
+    policy_active_expire_after         = null  # indefinite
+    policy_active_require_justification = false
+
+    # PIM policy config for eligible roles:
+    policy_eligible_expiration_required = false
+    policy_eligible_expire_after       = null
+    policy_activation_maximum_duration = "PT8H"
+    policy_activation_require_approval = true
+    # etc.
+
+    # minimal notifications
+    policy_notify_active_assignments_notification_level   = "Critical"
+    policy_notify_eligible_assignments_notification_level = "All"
+    policy_notify_eligible_activations_notification_level = "All"
+
+    # If we want approval, we supply group name
+    pim_approver_group_name = "PIMApproverTeam"
+
+    # Active roles
+    active_active_description   = "Always-active roles for SecGroup"
+    active_rbac_admin_condition = null
+    active_roles = ["Reader", "Contributor"]
+
+    # Eligible roles
+    eligible_justification    = "Elevate if needed"
+    eligible_ticket_number    = "CHG-1111"
+    pim_roles = ["User Access Administrator"]
+  }
+}
